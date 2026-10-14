@@ -2,7 +2,7 @@ import "dotenv/config";
 import express from "express";
 import crypto from "crypto";
 import { pool, initDb, publish, jsonError, fail, bodyDefault, installErrorHandlers,
-  authenticate, auditTrail, requireRole, isAdmin, sameEntity, callService, withScheme, AUTH_URL } from "./common.js";
+  authenticate, auditTrail, requireRole, isAdmin, isMaster, sameEntity, callService, withScheme, AUTH_URL, getScope, ScopeError } from "./common.js";
 
 const app = express();
 const PORT = process.env.PORT || 3003;
@@ -161,11 +161,22 @@ app.post("/shipments", requireRole("distribuidor"), async (req, res) => {
 });
 
 // 2.7 (M1): cada rol ve solo los envíos que le corresponden.
-//   admin: todos · distribuidor: los que envió o recibió · veterinaria: los que recibió
-//   fabricante: los de sus propios lotes.
-async function visibleFilter(req) {
+//   master-admin: todos · admin (2.10): los que envió o recibió una entidad de su ámbito o
+//   que son de lotes de sus fabricantes · distribuidor: los que envió o recibió ·
+//   veterinaria: los que recibió · fabricante: los de sus propios lotes.
+async function adminFilter(req, query = {}) {
+  let scope;
+  try { scope = await getScope(req, query); }
+  catch (e) { if (e instanceof ScopeError) throw new Rejection(e.status, e.message); throw e; }
+  if (scope.all) return { sql: "true", params: [], scope };
+  const r = await callService(MANUFACTURING, "/batches", req, { timeout: 15000 });
+  if (!r.ok) throw new Rejection(503, "No se pudieron consultar los lotes. Intenta de nuevo.");
+  const own = (r.data || []).filter((b) => scope.has(b.manufacturer)).map((b) => b.id);
+  return { sql: "(lower(trim(from_entity)) = any($1::text[]) or lower(trim(to_entity)) = any($1::text[]) or batch_id = any($2::uuid[]))", params: [[...scope.names], own], scope };
+}
+async function visibleFilter(req, query) {
   const { role, name } = req.auth;
-  if (role === "admin") return { sql: "true", params: [] };
+  if (isAdmin(req)) return adminFilter(req, query);
   if (role === "distribuidor") return { sql: "(lower(trim(from_entity))=lower(trim($1)) or lower(trim(to_entity))=lower(trim($1)))", params: [name] };
   if (role === "veterinaria") return { sql: "lower(trim(to_entity))=lower(trim($1))", params: [name] };
   if (role === "fabricante") {
@@ -178,7 +189,7 @@ async function visibleFilter(req) {
 }
 const canSee = (req, s) => {
   const { role, name } = req.auth;
-  if (role === "admin") return true;
+  if (isMaster(req)) return true;
   if (role === "distribuidor") return sameEntity(s.from_entity, name) || sameEntity(s.to_entity, name);
   if (role === "veterinaria") return sameEntity(s.to_entity, name);
   return false; // fabricante: se resuelve con visibleFilter
@@ -186,7 +197,8 @@ const canSee = (req, s) => {
 
 app.get("/shipments", async (req, res) => {
   try {
-    const f = await visibleFilter(req);
+    // 2.10: la administración puede acotar a un administrador o usuario (reportes) y por fechas.
+    const f = await visibleFilter(req, isAdmin(req) ? { adminId: req.query.admin_id, userId: req.query.user_id } : {});
     const params = [...f.params];
     let where = `where ${f.sql}`;
     if (req.query.batch_id) {
@@ -194,7 +206,17 @@ app.get("/shipments", async (req, res) => {
       params.push(req.query.batch_id);
       where += ` and batch_id=$${params.length}`;
     }
-    res.json((await pool.query(`select * from shipments ${where} order by shipped_at desc limit 500`, params)).rows);
+    for (const [q, op] of [["from", ">="], ["to", "<"]]) {
+      if (!req.query[q]) continue;
+      if (isNaN(new Date(String(req.query[q])))) return jsonError(res, 400, `Fecha "${q}" no válida`);
+      params.push(String(req.query[q]));
+      where += ` and shipped_at ${op} $${params.length}::timestamptz`;
+    }
+    // Antes el límite fijo de 500 recortaba los reportes sin avisar. La administración puede
+    // pedir hasta 20.000 filas (los listados de pantalla siguen usando 500 por defecto).
+    const max = isAdmin(req) ? 20000 : 500;
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 500, 1), max);
+    res.json((await pool.query(`select * from shipments ${where} order by shipped_at desc limit ${limit}`, params)).rows);
   } catch (e) { reject(res, e, "Error consultando envíos"); }
 });
 
@@ -226,6 +248,9 @@ app.get("/shipments/:id", async (req, res) => {
     if (req.auth.role === "fabricante") {
       const f = await visibleFilter(req);
       if (!f.params[0].includes(s.batch_id)) return jsonError(res, 404, "Envío no encontrado");
+    } else if (req.auth.role === "admin") {
+      const f = await adminFilter(req);
+      if (!f.scope.has(s.from_entity) && !f.scope.has(s.to_entity) && !f.params[1].includes(s.batch_id)) return jsonError(res, 404, "Envío no encontrado");
     } else if (!canSee(req, s)) return jsonError(res, 404, "Envío no encontrado");
     res.json(s);
   } catch (e) { reject(res, e, "Error consultando el envío"); }
